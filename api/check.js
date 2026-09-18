@@ -237,13 +237,37 @@ async function loadSecondaryPage(browser, link) {
   try {
     page = await browser.newPage();
     await page.setUserAgent("Mozilla/5.0 (compatible; ReeloMetaCheck/2.0; +headless)");
-    page.setDefaultNavigationTimeout(12000);
-    const response = await page.goto(link.href, { waitUntil: "networkidle2", timeout: 12000 });
-    if (!response || !response.ok()) return null;
+    page.setDefaultNavigationTimeout(15000);
+
+    let response;
+    try {
+      response = await page.goto(link.href, { waitUntil: "networkidle2", timeout: 15000 });
+    } catch (navErr) {
+      // Some pages (chat widgets, analytics, ad pixels) never go fully
+      // network-idle. If the networkidle2 wait timed out, don't give up —
+      // retry with a lighter wait condition that still captures the
+      // rendered content, just without waiting for background network
+      // activity to fully settle.
+      if (/timeout/i.test(navErr.message)) {
+        try {
+          response = await page.goto(link.href, { waitUntil: "domcontentloaded", timeout: 8000 });
+        } catch (retryErr) {
+          return { label: link.label, url: link.href, ok: false, reason: "Timed out loading this page." };
+        }
+      } else {
+        return { label: link.label, url: link.href, ok: false, reason: "Could not load this page." };
+      }
+    }
+
+    if (!response || response.status() >= 400) {
+      const status = response ? response.status() : null;
+      return { label: link.label, url: link.href, ok: false, reason: status ? `Page responded with status ${status}.` : "Could not load this page." };
+    }
+
     const rawText = await page.evaluate(() => (document.body ? document.body.innerText : ""));
-    return { label: link.label, url: link.href, text: normalizeText(rawText) };
+    return { label: link.label, url: link.href, text: normalizeText(rawText), ok: true };
   } catch (e) {
-    return null; // a broken/slow secondary page just gets skipped, not fatal
+    return { label: link.label, url: link.href, ok: false, reason: "Could not load this page." };
   } finally {
     if (page) await page.close().catch(() => {});
   }
@@ -280,7 +304,7 @@ async function renderSite(target) {
       throw Object.assign(new Error(msg), { isNavError: true });
     }
 
-    if (!response || !response.ok()) {
+    if (!response || response.status() >= 400) {
       const status = response ? response.status() : null;
       throw Object.assign(new Error(status ? `Site responded with status ${status}` : "The site could not be reached."), { isNavError: true });
     }
@@ -298,11 +322,13 @@ async function renderSite(target) {
     const priorityLinks = pickPriorityLinks(rawLinks, target, MAX_EXTRA_PAGES);
 
     const extraResults = await Promise.allSettled(priorityLinks.map((link) => loadSecondaryPage(browser, link)));
-    const extraPages = extraResults.filter((r) => r.status === "fulfilled" && r.value).map((r) => r.value);
+    const settled = extraResults.map((r) => (r.status === "fulfilled" ? r.value : null)).filter(Boolean);
+    const extraPages = settled.filter((p) => p.ok);
+    const failedPages = settled.filter((p) => !p.ok);
 
     const pages = [{ label: "Home", url: target, text: homeText }, ...extraPages];
 
-    return { pages, hasPasswordField, isSecure, finalUrl };
+    return { pages, failedPages, hasPasswordField, isSecure, finalUrl };
   } finally {
     await browser.close();
   }
@@ -357,12 +383,14 @@ module.exports = async (req, res) => {
   }
 
   let pages = [];
+  let failedPages = [];
   let hasPasswordField = false;
   let isSecure = true;
 
   try {
     const rendered = await renderSite(target);
     pages = rendered.pages;
+    failedPages = rendered.failedPages || [];
     hasPasswordField = rendered.hasPasswordField;
     isSecure = rendered.isSecure;
   } catch (err) {
@@ -528,6 +556,7 @@ module.exports = async (req, res) => {
 
   const checks = [liveCheck, secureCheck, legalNameCheck, linkCheck, castingCheck, contactCheck, languageCheck, restrictedCheck];
   const pagesChecked = pages.map((p) => ({ label: p.label, url: p.url }));
+  const pagesFailed = failedPages.map((p) => ({ label: p.label, url: p.url, reason: p.reason }));
 
-  return res.status(200).json({ target, checks, pagesChecked, unreachable: false });
+  return res.status(200).json({ target, checks, pagesChecked, pagesFailed, unreachable: false });
 };
