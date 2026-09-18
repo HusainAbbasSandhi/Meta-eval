@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "api/check.js": {
+      "memory": 1536,
+      "maxDuration": 45
+    }
+  }
+}
